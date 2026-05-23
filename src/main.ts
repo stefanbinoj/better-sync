@@ -1,99 +1,177 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import { Notice, Plugin, setIcon } from "obsidian";
+import { DEFAULT_SETTINGS, MyPluginSettings, FileChange } from "./types";
+import {  SYNC_INTERVAL_MS } from "./constants";
+import { SettingsTab } from "./settings";
+import { getClient } from "./client";
+import { Debouncer } from "./helpers/debounce";
+import { type Files } from "files-sdk";
 
-// Remember to rename these classes and interfaces!
-
-export default class MyPlugin extends Plugin {
+export default class BetterSyncPlugin extends Plugin {
 	settings: MyPluginSettings;
+	private isSyncing: boolean = false;
+	private statusBarItem: HTMLElement;
+	private client: Files | null = null;
+	private isFirstSync: boolean = true;
+	private debouncer: Debouncer;
 
-	async onload() {
+	async onload(): Promise<void> {
 		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+		this.initializeClient();
+		this.setupUI();
+		this.setupCommands();
+		this.setupVaultEvents();
+		this.debouncer = new Debouncer((changes) => this.pushToCloud(changes));
+		this.sync();
+		this.registerInterval(window.setInterval(() => this.pullFromCloud(), SYNC_INTERVAL_MS));
 	}
 
-	onunload() {
+	onunload(): void {
+		this.debouncer.cancel();
 	}
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+	private setupVaultEvents(): void {
+		this.registerEvent(this.app.vault.on("create", (file) => this.debouncer.queue(file.path, "create")));
+		this.registerEvent(this.app.vault.on("modify", (file) => this.debouncer.queue(file.path, "modify")));
+		this.registerEvent(this.app.vault.on("delete", (file) => this.debouncer.queue(file.path, "delete")));
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				this.debouncer.queue(file.path, "rename");
+				this.debouncer.queue(oldPath, "delete");
+			}),
+		);
 	}
 
-	async saveSettings() {
+	initializeClient(): void {
+		const syncProvider = this.settings.syncProvider;
+		const credentials = this.settings.credentials;
+		this.client = getClient(syncProvider, credentials);
+	}
+
+	private async loadSettings(): Promise<void> {
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+	}
+
+	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 	}
-}
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+	private setupUI(): void {
+		this.statusBarItem = this.addStatusBarItem();
+		this.statusBarItem.addClass("better-sync-status");
+		setIcon(this.statusBarItem, "refresh-cw");
+		this.statusBarItem.setAttr("aria-label", "Better Sync files");
+		// this.statusBarItem.addEventListener("click", () => this.normalSync());
+		this.statusBarItem.hide();
+
+		this.addSettingTab(new SettingsTab(this.app, this));
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	private setupCommands(): void {
+		this.addCommand({
+			id: "sync-now",
+			name: "Sync files now",
+			callback: () => this.normalSync(this.debouncer.getPendingChanges),
+		});
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	private async pushToCloud(changes: FileChange[]): Promise<void> {
+		if (!this.basicChecksBeforeSync()) return;
+
+		if (changes.length === 0) return;
+
+		console.log("Pushing changes to cloud...");
+		for (const change of changes) {
+			console.log(`  - ${change.action}: ${change.path}`);
+		}
+		this.startSyncing();
+
+		try {
+			for (const change of changes) {
+				switch (change.action) {
+					case "create":
+						await this.createFileOnCloud(change.path);
+						break;
+					case "modify":
+						await this.modifyFileOnCloud(change.path);
+						break;
+					case "rename":
+						await this.uploadFileOnCloud(change.path);
+						break;
+					case "delete":
+						await this.deleteFileOnCloud(change.path);
+						break;
+				}
+			}
+		} catch (e) {
+		} finally {
+			this.stopSyncing();
+		}
 	}
+
+	private async pullFromCloud(): Promise<void> { }
+
+	private async normalSync(changes?: FileChange[]): Promise<void> { }
+
+	private async startInitialSync(): Promise<void> {
+		if (!this.basicChecksBeforeSync()) {
+			return;
+		}
+
+		console.log("Starting initial sync...");
+		this.startSyncing();
+		try {
+			// sync both local and cloud
+			const cloudFiles = await this.client!.list();
+			const files = this.app.vault.getMarkdownFiles();
+
+			for (const file of files) {
+				if (!file) continue;
+				await this.app.vault.cachedRead(file);
+			}
+		} catch (error) {
+			console.error("Error during initial sync:", error);
+			new Notice("Error during initial sync. Check console for details.");
+		} finally {
+			this.stopSyncing();
+		}
+	}
+
+	private async sync(): Promise<void> {
+		if (this.isFirstSync) {
+			this.startInitialSync();
+			this.isFirstSync = false;
+		} else {
+			this.normalSync();
+		}
+	}
+
+	private async basicChecksBeforeSync() {
+		if (!this.client) {
+			return false;
+		}
+		if (this.isSyncing) {
+			return false;
+		}
+		return true;
+	}
+
+	private startSyncing(): void {
+		this.isSyncing = true;
+		this.statusBarItem.show();
+		this.statusBarItem.addClass("is-syncing");
+	}
+
+	private stopSyncing(): void {
+		this.isSyncing = false;
+		this.statusBarItem.removeClass("is-syncing");
+		this.statusBarItem.hide();
+	}
+
+	private async createFileOnCloud(path: string): Promise<void> { }
+
+	private async modifyFileOnCloud(path: string): Promise<void> { }
+
+	private async uploadFileOnCloud(path: string): Promise<void> { }
+
+	private async deleteFileOnCloud(path: string): Promise<void> { }
 }

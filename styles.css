@@ -1,8 +1,23 @@
-/*
+.better-sync-status {
+	--icon-size: var(--icon-size-m);
+	--icon-color: var(--text-muted);
+	cursor: pointer;
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+.better-sync-status.is-syncing {
+	--icon-color: var(--interactive-accent);
+}
 
-If your plugin does not need CSS, delete this file.
+.better-sync-status.is-syncing svg {
+	animation: better-sync-spin 900ms linear infinite;
+}
 
-*/
+@keyframes better-sync-spin {
+	from {
+		transform: rotate(0deg);
+	}
+
+	to {
+		transform: rotate(360deg);
+	}
+}
