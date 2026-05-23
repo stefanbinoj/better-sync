@@ -1,10 +1,11 @@
 import { Notice, Plugin, setIcon } from "obsidian";
 import { DEFAULT_SETTINGS, MyPluginSettings, FileChange } from "./types";
-import {  SYNC_INTERVAL_MS } from "./constants";
+import { SYNC_INTERVAL_MS } from "./constants";
 import { SettingsTab } from "./settings";
 import { getClient } from "./client";
 import { Debouncer } from "./helpers/debounce";
 import { type Files } from "files-sdk";
+import { createDatabase, initializeSchemas, closeDatabase, type BetterSyncDatabase } from "./db/client";
 
 export default class BetterSyncPlugin extends Plugin {
 	settings: MyPluginSettings;
@@ -13,8 +14,11 @@ export default class BetterSyncPlugin extends Plugin {
 	private client: Files | null = null;
 	private isFirstSync: boolean = true;
 	private debouncer: Debouncer;
+	private db: BetterSyncDatabase;
 
 	async onload(): Promise<void> {
+		this.db = createDatabase(this.manifest.dir!);
+		initializeSchemas(this.db);
 		await this.loadSettings();
 		this.initializeClient();
 		this.setupUI();
@@ -27,6 +31,7 @@ export default class BetterSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.debouncer.cancel();
+		closeDatabase(this.db);
 	}
 
 	private setupVaultEvents(): void {
